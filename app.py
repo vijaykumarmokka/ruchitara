@@ -20,7 +20,7 @@ CORS(app)
 DATABASE_URL = "postgresql://vinayreddychetelli:WQ74scvC81kv9BnD5eXi3PM4G6F8qakC@dpg-d52udav5r7bs73deu0n0-a.virginia-postgres.render.com/ruchitara_db"
 
 # Fast2SMS Configuration
-FAST2SMS_API_KEY = os.getenv('FAST2SMS_API_KEY', 'YOUR_FAST2SMS_API_KEY_HERE')
+FAST2SMS_API_KEY = "VRs0wZD9SnHxoeEGNLvYrakT6hy3bAFJ74tWCpPBuXjgcUKq8lHyp71M3euN9shI4cZrPG5AOKSnbJwj"
 FAST2SMS_URL = "https://www.fast2sms.com/dev/bulkV2"
 
 # For testing - set to False when you want to use real SMS
