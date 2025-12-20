@@ -184,7 +184,7 @@ def test():
         'success': True,
         'message': 'Server is running!',
         'timestamp': datetime.now().isoformat(),
-        'sms_mode': 'TEST' if USE_TEST_OTP else 'PRODUCTION'
+        'sms_mode': 'TEST - ANY OTP ACCEPTED' if USE_TEST_OTP else 'PRODUCTION'
     })
 
 # ============================================================================
@@ -227,7 +227,7 @@ def send_otp():
         # Generate OTP
         if USE_TEST_OTP:
             otp = TEST_OTP
-            print(f"🔑 Using Test OTP: {otp}")
+            print(f"🔑 TEST MODE: Any OTP will be accepted for login")
             sms_sent = True
         else:
             otp = generate_otp()
@@ -252,6 +252,7 @@ def send_otp():
         if USE_TEST_OTP:
             response_data['otp'] = otp
             response_data['test_mode'] = True
+            response_data['bypass_info'] = 'Any OTP will be accepted'
         
         if user:
             response_data['is_existing_user'] = True
@@ -269,7 +270,7 @@ def send_otp():
 
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def verify_otp():
-    """Verify OTP and log in user"""
+    """Verify OTP and log in user - ACCEPTS ANY OTP IN TEST MODE"""
     try:
         data = request.json
         phone_number = data.get('phone_number')
@@ -281,51 +282,72 @@ def verify_otp():
         phone_number = clean_phone_number(phone_number)
         print(f"🔐 Verifying OTP for: {phone_number}")
         
-        # Check if OTP exists
-        if phone_number not in otp_storage:
-            return jsonify({'success': False, 'message': 'No OTP request found. Please request a new OTP.'}), 400
-        
-        stored_otp_data = otp_storage[phone_number]
-        
-        # Check if OTP has expired
-        if datetime.now() > stored_otp_data['expires_at']:
+        # ==========================================
+        # BYPASS MODE - Accept any OTP in test mode
+        # ==========================================
+        if USE_TEST_OTP:
+            print(f"⚠️ TEST MODE: Accepting any OTP (entered: {otp})")
+            # Clean up OTP storage if exists
+            if phone_number in otp_storage:
+                del otp_storage[phone_number]
+        else:
+            # Normal OTP verification logic for production
+            if phone_number not in otp_storage:
+                return jsonify({'success': False, 'message': 'No OTP request found. Please request a new OTP.'}), 400
+            
+            stored_otp_data = otp_storage[phone_number]
+            
+            # Check if OTP has expired
+            if datetime.now() > stored_otp_data['expires_at']:
+                del otp_storage[phone_number]
+                return jsonify({'success': False, 'message': 'OTP has expired. Please request a new one.'}), 400
+            
+            # Check attempts
+            if stored_otp_data['attempts'] >= 5:
+                del otp_storage[phone_number]
+                return jsonify({'success': False, 'message': 'Too many failed attempts. Please request a new OTP.'}), 400
+            
+            # Verify OTP
+            if otp != stored_otp_data['otp']:
+                stored_otp_data['attempts'] += 1
+                remaining = 5 - stored_otp_data['attempts']
+                return jsonify({'success': False, 'message': f'Invalid OTP. {remaining} attempt{"s" if remaining != 1 else ""} remaining.'}), 400
+            
+            # Clean up on success
             del otp_storage[phone_number]
-            return jsonify({'success': False, 'message': 'OTP has expired. Please request a new one.'}), 400
-        
-        # Check attempts
-        if stored_otp_data['attempts'] >= 5:
-            del otp_storage[phone_number]
-            return jsonify({'success': False, 'message': 'Too many failed attempts. Please request a new OTP.'}), 400
-        
-        # Verify OTP
-        if otp != stored_otp_data['otp']:
-            stored_otp_data['attempts'] += 1
-            remaining = 5 - stored_otp_data['attempts']
-            return jsonify({'success': False, 'message': f'Invalid OTP. {remaining} attempt{"s" if remaining != 1 else ""} remaining.'}), 400
         
         print(f"✅ OTP verified successfully for: {phone_number}")
-        del otp_storage[phone_number]
         
         conn = get_db_connection()
         cur = conn.cursor()
         
+        # Get or create user
         cur.execute('SELECT * FROM user_profiles WHERE phone_number = %s', (phone_number,))
         user = cur.fetchone()
+        
+        if not user:
+            cur.execute('INSERT INTO user_profiles (phone_number) VALUES (%s) RETURNING *', (phone_number,))
+            user = cur.fetchone()
+            conn.commit()
+            print(f"🆕 Created user profile during verification for: {phone_number}")
         
         cur.close()
         conn.close()
         
-        if not user:
-            return jsonify({'success': False, 'message': 'User profile not found'}), 404
-        
         profile_complete = bool(user['name'] and user['email'])
         
-        return jsonify({
+        response = {
             'success': True,
             'message': 'Login successful',
             'user': dict(user),
             'requires_profile_setup': not profile_complete
-        })
+        }
+        
+        if USE_TEST_OTP:
+            response['test_mode'] = True
+            response['bypass_used'] = True
+        
+        return jsonify(response)
         
     except Exception as e:
         print(f"Error in verify_otp: {e}")
@@ -347,7 +369,7 @@ def resend_otp():
         
         if USE_TEST_OTP:
             otp = TEST_OTP
-            print(f"🔑 Using Test OTP: {otp}")
+            print(f"🔑 TEST MODE: Any OTP will be accepted")
             sms_sent = True
         else:
             otp = generate_otp()
@@ -366,11 +388,64 @@ def resend_otp():
         if USE_TEST_OTP:
             response['otp'] = otp
             response['test_mode'] = True
+            response['bypass_info'] = 'Any OTP will be accepted'
         
         return jsonify(response)
         
     except Exception as e:
         print(f"Error in resend_otp: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+# ============================================================================
+# DIRECT BYPASS ENDPOINT (Optional - for complete OTP skip)
+# ============================================================================
+
+@app.route('/api/auth/bypass-login', methods=['POST'])
+def bypass_login():
+    """Bypass OTP completely for testing - directly log in with phone number"""
+    try:
+        data = request.json
+        phone_number = data.get('phone_number')
+        
+        if not phone_number:
+            return jsonify({'success': False, 'message': 'Phone number is required'}), 400
+        
+        phone_number = clean_phone_number(phone_number)
+        
+        if len(phone_number) != 10:
+            return jsonify({'success': False, 'message': 'Please enter a valid 10-digit phone number'}), 400
+        
+        print(f"🚀 BYPASS LOGIN for: {phone_number}")
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Check if user exists, if not create
+        cur.execute('SELECT * FROM user_profiles WHERE phone_number = %s', (phone_number,))
+        user = cur.fetchone()
+        
+        if not user:
+            cur.execute('INSERT INTO user_profiles (phone_number) VALUES (%s) RETURNING *', (phone_number,))
+            user = cur.fetchone()
+            conn.commit()
+            print(f"🆕 Created user profile for: {phone_number}")
+        
+        cur.close()
+        conn.close()
+        
+        profile_complete = bool(user['name'] and user['email'])
+        
+        return jsonify({
+            'success': True,
+            'message': 'Login successful (bypassed)',
+            'user': dict(user),
+            'requires_profile_setup': not profile_complete,
+            'bypassed': True
+        })
+        
+    except Exception as e:
+        print(f"Error in bypass_login: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -701,154 +776,4 @@ def create_order():
         payment_method = data.get('payment_method', 'Cash on Delivery')
         
         if not phone_number or not items:
-            return jsonify({'success': False, 'message': 'Phone number and items are required'}), 400
-        
-        if not delivery_address:
-            return jsonify({'success': False, 'message': 'Delivery address is required'}), 400
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        total_amount = sum(item['quantity'] * item['unit_price'] for item in items)
-        order_number = f"ORD{random.randint(10000, 99999)}"
-        
-        cur.execute('''
-            INSERT INTO orders (order_number, phone_number, status, total_amount, 
-                              delivery_address, payment_method)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING *
-        ''', (order_number, phone_number, 'Pending', total_amount, delivery_address, payment_method))
-        
-        order = cur.fetchone()
-        
-        for item in items:
-            cur.execute('''
-                INSERT INTO order_items (order_id, product_id, product_name, 
-                                       quantity, unit_price, subtotal)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            ''', (order['id'], item['product_id'], item['name'],
-                  item['quantity'], item['unit_price'],
-                  item['quantity'] * item['unit_price']))
-        
-        # Clear cart
-        cur.execute('DELETE FROM cart_items WHERE phone_number = %s', (phone_number,))
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        print(f"📦 Order created - Order ID: {order['id']}, Phone: {phone_number}")
-        
-        return jsonify({'success': True, 'order': dict(order), 'message': 'Order placed successfully'})
-        
-    except Exception as e:
-        print(f"Error in create_order: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'message': str(e)}), 500
-
-# ============================================================================
-# PRODUCTS ENDPOINTS (unchanged)
-# ============================================================================
-
-@app.route('/api/products', methods=['GET'])
-def get_products():
-    """Get all products"""
-    try:
-        category = request.args.get('category')
-        search = request.args.get('search')
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        query = '''
-            SELECT p.*, c.name as category_name 
-            FROM products p
-            LEFT JOIN categories c ON p.category_id = c.id
-            WHERE p.is_available = TRUE
-        '''
-        params = []
-        
-        if category:
-            query += ' AND c.name = %s'
-            params.append(category)
-        
-        if search:
-            query += ' AND p.name ILIKE %s'
-            params.append(f'%{search}%')
-        
-        query += ' ORDER BY p.name'
-        
-        cur.execute(query, params)
-        products = cur.fetchall()
-        
-        cur.close()
-        conn.close()
-        
-        return jsonify({'success': True, 'products': [dict(p) for p in products]})
-    except Exception as e:
-        print(f"Error in get_products: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'message': str(e)}), 500
-
-@app.route('/api/categories', methods=['GET'])
-def get_categories():
-    """Get all categories"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute('SELECT * FROM categories ORDER BY display_order')
-        categories = cur.fetchall()
-        
-        cur.close()
-        conn.close()
-        
-        return jsonify({'success': True, 'categories': [dict(c) for c in categories]})
-    except Exception as e:
-        print(f"Error in get_categories: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'message': str(e)}), 500
-
-# ============================================================================
-# ERROR HANDLERS
-# ============================================================================
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'success': False, 'message': 'Endpoint not found'}), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({'success': False, 'message': 'Internal server error'}), 500
-
-# ============================================================================
-# RUN SERVER
-# ============================================================================
-
-if __name__ == '__main__':
-    print("=" * 60)
-    print("🚀 Starting Ruchitara Flask Server")
-    print("=" * 60)
-    print("Database: Render PostgreSQL")
-    print("Primary Key: phone_number")
-    print(f"SMS Mode: {'TEST (OTP: 9999)' if USE_TEST_OTP else 'PRODUCTION'}")
-    print("Port: 8000")
-    print("=" * 60)
-    
-    # Initialize database
-    init_database()
-    
-    # Test database connection
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT COUNT(*) as count FROM user_profiles')
-        result = cur.fetchone()
-        print(f"✅ Users in DB: {result['count']}")
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ Database connection failed: {e}")
-    
-    print("=" * 60)
-    app.run(debug=True, host='0.0.0.0', port=8000)
+            return jsonify({'success': False
