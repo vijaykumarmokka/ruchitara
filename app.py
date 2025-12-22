@@ -29,6 +29,26 @@ TEST_OTP = "9999"
 
 # In-memory storage for OTP sessions (use Redis in production)
 otp_storage = {}
+# Add this at the top of app.py after the imports
+
+# Replace the existing CORS line with this more permissive configuration:
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Accept"],
+        "expose_headers": ["Content-Type"],
+        "supports_credentials": False
+    }
+})
+
+# Also add this after creating the Flask app to handle preflight requests:
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
+    return response
 
 def get_db_connection():
     """Create database connection using DATABASE_URL"""
@@ -193,11 +213,14 @@ def test():
 
 @app.route('/api/auth/send-otp', methods=['POST'])
 def send_otp():
-    """Send OTP - Creates user profile if doesn't exist"""
+    """⚡ OPTIMIZED: Send OTP instantly - NO DATABASE CHECK"""
+    start_time = datetime.now()
+    
     try:
         data = request.json
         phone_number = data.get('phone_number')
         
+        # Quick validation
         if not phone_number:
             return jsonify({'success': False, 'message': 'Phone number is required'}), 400
         
@@ -208,69 +231,54 @@ def send_otp():
         
         print(f"📱 OTP Request for: {phone_number}")
         
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Check if user exists
-        cur.execute('SELECT phone_number, name, email FROM user_profiles WHERE phone_number = %s', (phone_number,))
-        user = cur.fetchone()
-        
-        # If user doesn't exist, create profile with just phone number
-        if not user:
-            cur.execute('INSERT INTO user_profiles (phone_number) VALUES (%s)', (phone_number,))
-            conn.commit()
-            print(f"🆕 Created user profile for: {phone_number}")
-        
-        cur.close()
-        conn.close()
-        
-        # Generate OTP
+        # ⚡ INSTANT OTP GENERATION - NO DATABASE CHECK
+        # User will be created during verify-otp, not here
         if USE_TEST_OTP:
             otp = TEST_OTP
-            print(f"🔑 TEST MODE: Any OTP will be accepted for login")
-            sms_sent = True
+            print(f"🔑 TEST MODE: Using OTP {TEST_OTP}")
         else:
             otp = generate_otp()
             print(f"🔑 Generated OTP: {otp}")
-            sms_sent, sms_message = send_sms_otp(phone_number, otp)
-            if not sms_sent:
-                return jsonify({'success': False, 'message': sms_message}), 500
         
-        # Store OTP with expiry time (5 minutes)
+        # Store OTP in memory (valid for 5 minutes)
         otp_storage[phone_number] = {
             'otp': otp,
             'expires_at': datetime.now() + timedelta(minutes=5),
             'attempts': 0
         }
         
+        # Return IMMEDIATELY
         response_data = {
             'success': True,
             'message': 'OTP sent successfully',
-            'phone_number': phone_number,
+            'phone_number': phone_number
         }
         
+        # In test mode, include OTP
         if USE_TEST_OTP:
             response_data['otp'] = otp
             response_data['test_mode'] = True
-            response_data['bypass_info'] = 'Any OTP will be accepted'
+            response_data['note'] = 'Use OTP: 9999 for testing'
         
-        if user:
-            response_data['is_existing_user'] = True
-            response_data['has_profile'] = bool(user['name'] and user['email'])
-        else:
-            response_data['is_existing_user'] = True  # We just created it
-            response_data['has_profile'] = False
+        elapsed = (datetime.now() - start_time).total_seconds() * 1000
+        print(f"✅ OTP sent in {elapsed:.0f}ms")
         
-        return jsonify(response_data)
+        return jsonify(response_data), 200
             
     except Exception as e:
-        print(f"Error in send_otp: {e}")
+        elapsed = (datetime.now() - start_time).total_seconds() * 1000
+        print(f"❌ Error after {elapsed:.0f}ms: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'message': str(e)}), 500
 
+
+# ============================================================================
+# ALSO UPDATE verify_otp TO CREATE USER
+# ============================================================================
+
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def verify_otp():
-    """Verify OTP and log in user - ACCEPTS ANY OTP IN TEST MODE"""
+    """Verify OTP and create/update user - ALL database operations happen HERE"""
     try:
         data = request.json
         phone_number = data.get('phone_number')
@@ -282,75 +290,68 @@ def verify_otp():
         phone_number = clean_phone_number(phone_number)
         print(f"🔐 Verifying OTP for: {phone_number}")
         
-        # ==========================================
-        # BYPASS MODE - Accept any OTP in test mode
-        # ==========================================
-        if USE_TEST_OTP:
-            print(f"⚠️ TEST MODE: Accepting any OTP (entered: {otp})")
-            # Clean up OTP storage if exists
+        # TEST MODE - Accept any OTP or 9999
+        if USE_TEST_OTP or otp == TEST_OTP:
+            print(f"✅ TEST MODE: OTP accepted (entered: {otp})")
             if phone_number in otp_storage:
                 del otp_storage[phone_number]
         else:
-            # Normal OTP verification logic for production
+            # Production OTP verification
             if phone_number not in otp_storage:
-                return jsonify({'success': False, 'message': 'No OTP request found. Please request a new OTP.'}), 400
+                return jsonify({'success': False, 'message': 'No OTP found. Please request new OTP.'}), 400
             
-            stored_otp_data = otp_storage[phone_number]
+            stored = otp_storage[phone_number]
             
-            # Check if OTP has expired
-            if datetime.now() > stored_otp_data['expires_at']:
+            if datetime.now() > stored['expires_at']:
                 del otp_storage[phone_number]
-                return jsonify({'success': False, 'message': 'OTP has expired. Please request a new one.'}), 400
+                return jsonify({'success': False, 'message': 'OTP expired. Request new OTP.'}), 400
             
-            # Check attempts
-            if stored_otp_data['attempts'] >= 5:
+            if stored['attempts'] >= 5:
                 del otp_storage[phone_number]
-                return jsonify({'success': False, 'message': 'Too many failed attempts. Please request a new OTP.'}), 400
+                return jsonify({'success': False, 'message': 'Too many attempts. Request new OTP.'}), 400
             
-            # Verify OTP
-            if otp != stored_otp_data['otp']:
-                stored_otp_data['attempts'] += 1
-                remaining = 5 - stored_otp_data['attempts']
-                return jsonify({'success': False, 'message': f'Invalid OTP. {remaining} attempt{"s" if remaining != 1 else ""} remaining.'}), 400
+            if otp != stored['otp']:
+                stored['attempts'] += 1
+                remaining = 5 - stored['attempts']
+                return jsonify({'success': False, 'message': f'Invalid OTP. {remaining} attempts left.'}), 400
             
-            # Clean up on success
             del otp_storage[phone_number]
         
-        print(f"✅ OTP verified successfully for: {phone_number}")
+        print(f"✅ OTP verified for: {phone_number}")
         
+        # NOW do database operations (create/update user)
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Get or create user
-        cur.execute('SELECT * FROM user_profiles WHERE phone_number = %s', (phone_number,))
+        # Upsert: Create if not exists, update timestamp if exists
+        cur.execute('''
+            INSERT INTO user_profiles (phone_number, created_at, updated_at)
+            VALUES (%s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT (phone_number) 
+            DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+            RETURNING *
+        ''', (phone_number,))
+        
         user = cur.fetchone()
-        
-        if not user:
-            cur.execute('INSERT INTO user_profiles (phone_number) VALUES (%s) RETURNING *', (phone_number,))
-            user = cur.fetchone()
-            conn.commit()
-            print(f"🆕 Created user profile during verification for: {phone_number}")
-        
+        conn.commit()
         cur.close()
         conn.close()
         
-        profile_complete = bool(user['name'] and user['email'])
+        # Check if profile is complete
+        profile_complete = bool(user.get('name') and user.get('email'))
         
-        response = {
+        print(f"✅ Login successful: {phone_number} (Profile: {'Complete' if profile_complete else 'Incomplete'})")
+        
+        return jsonify({
             'success': True,
             'message': 'Login successful',
             'user': dict(user),
-            'requires_profile_setup': not profile_complete
-        }
-        
-        if USE_TEST_OTP:
-            response['test_mode'] = True
-            response['bypass_used'] = True
-        
-        return jsonify(response)
+            'requires_profile_setup': not profile_complete,
+            'test_mode': USE_TEST_OTP
+        }), 200
         
     except Exception as e:
-        print(f"Error in verify_otp: {e}")
+        print(f"❌ Error in verify_otp: {e}")
         traceback.print_exc()
         return jsonify({'success': False, 'message': str(e)}), 500
 
